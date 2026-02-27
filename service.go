@@ -27,9 +27,19 @@ type Service struct {
 	handshake              HandshakeConfig
 	handshakeForServerName map[string]HandshakeConfig
 	strictMode             bool
+	wildcardSNI            WildcardSNI
+	v3FlowControl          V3FlowControlConfig
 	handler                N.TCPConnectionHandlerEx
 	logger                 logger.ContextLogger
 }
+
+type WildcardSNI int
+
+const (
+	WildcardSNIOff WildcardSNI = iota
+	WildcardSNIAuthed
+	WildcardSNIAll
+)
 
 type ServiceConfig struct {
 	Version                int
@@ -38,8 +48,15 @@ type ServiceConfig struct {
 	Handshake              HandshakeConfig
 	HandshakeForServerName map[string]HandshakeConfig // for protocol version 2/3
 	StrictMode             bool                       // for protocol version 3
+	WildcardSNI            WildcardSNI                // for protocol version 3
+	V3FlowControl          V3FlowControlConfig        // for protocol version 3
 	Handler                N.TCPConnectionHandlerEx
 	Logger                 logger.ContextLogger
+}
+
+type V3FlowControlConfig struct {
+	UpstreamBytesPerSecond   int64
+	DownstreamBytesPerSecond int64
 }
 
 type User struct {
@@ -60,15 +77,20 @@ func NewService(config ServiceConfig) (*Service, error) {
 		handshake:              config.Handshake,
 		handshakeForServerName: config.HandshakeForServerName,
 		strictMode:             config.StrictMode,
+		wildcardSNI:            config.WildcardSNI,
+		v3FlowControl:          config.V3FlowControl,
 		handler:                config.Handler,
 		logger:                 config.Logger,
 	}
 
-	if !service.handshake.Server.IsValid() {
+	if !service.handshake.Server.IsValid() && service.wildcardSNI == WildcardSNIOff {
 		return nil, E.New("missing default handshake information")
 	}
 
 	if service.handler == nil || service.logger == nil {
+		return nil, os.ErrInvalid
+	}
+	if service.v3FlowControl.UpstreamBytesPerSecond < 0 || service.v3FlowControl.DownstreamBytesPerSecond < 0 {
 		return nil, os.ErrInvalid
 	}
 	switch config.Version {
@@ -84,14 +106,12 @@ func NewService(config ServiceConfig) (*Service, error) {
 	return service, nil
 }
 
-func (s *Service) selectHandshake(clientHelloFrame *buf.Buffer) HandshakeConfig {
-	serverName, err := extractServerName(clientHelloFrame.Bytes())
-	if err == nil {
-		if customHandshake, found := s.handshakeForServerName[serverName]; found {
-			return customHandshake
-		}
-	}
-	return s.handshake
+func (s *Service) flowControlledConn(conn net.Conn) net.Conn {
+	return newFlowControlledConn(
+		conn,
+		s.v3FlowControl.UpstreamBytesPerSecond,
+		s.v3FlowControl.DownstreamBytesPerSecond,
+	)
 }
 
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -127,8 +147,17 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		if err != nil {
 			return E.Cause(err, "read client handshake")
 		}
-
-		handshakeConfig := s.selectHandshake(clientHelloFrame)
+		serverName, err := extractServerName(clientHelloFrame.Bytes())
+		var handshakeConfig HandshakeConfig
+		if err == nil {
+			if customHandshake, found := s.handshakeForServerName[serverName]; found {
+				handshakeConfig = customHandshake
+			} else {
+				handshakeConfig = s.handshake
+			}
+		} else {
+			handshakeConfig = s.handshake
+		}
 		handshakeConn, err := handshakeConfig.Dialer.DialContext(ctx, N.NetworkTCP, handshakeConfig.Server)
 		if err != nil {
 			return E.Cause(err, "server handshake")
@@ -154,28 +183,56 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		if err != nil {
 			return E.Cause(err, "read client handshake")
 		}
-
-		handshakeConfig := s.selectHandshake(clientHelloFrame)
-		handshakeConn, err := handshakeConfig.Dialer.DialContext(ctx, N.NetworkTCP, handshakeConfig.Server)
+		defer clientHelloFrame.Release()
+		serverName, err := extractServerName(clientHelloFrame.Bytes())
 		if err != nil {
-			return E.Cause(err, "server handshake")
+			return E.Cause(err, "extract server name")
 		}
-
-		_, err = handshakeConn.Write(clientHelloFrame.Bytes())
-		if err != nil {
-			clientHelloFrame.Release()
-			return E.Cause(err, "write client handshake")
+		var (
+			handshakeConfig HandshakeConfig
+			isCustom        bool
+		)
+		if customHandshake, found := s.handshakeForServerName[serverName]; found {
+			handshakeConfig = customHandshake
+			isCustom = true
+		} else {
+			handshakeConfig = s.handshake
+			if s.wildcardSNI != WildcardSNIOff {
+				handshakeConfig.Server = M.Socksaddr{
+					Fqdn: serverName,
+					Port: 443,
+				}
+			}
 		}
+		var handshakeConn net.Conn
 		user, err := verifyClientHello(clientHelloFrame.Bytes(), s.users)
 		if err != nil {
 			s.logger.WarnContext(ctx, E.Cause(err, "client hello verify failed"))
-			return bufio.CopyConn(ctx, conn, handshakeConn)
+			if s.wildcardSNI == WildcardSNIAll || isCustom {
+				handshakeConn, err = handshakeConfig.Dialer.DialContext(ctx, N.NetworkTCP, handshakeConfig.Server)
+			} else {
+				handshakeConn, err = s.handshake.Dialer.DialContext(ctx, N.NetworkTCP, s.handshake.Server)
+			}
+			if err != nil {
+				return E.Cause(err, "server handshake")
+			}
+			return bufio.CopyConn(ctx, s.flowControlledConn(bufio.NewCachedConn(conn, clientHelloFrame)), handshakeConn)
 		}
 		if user.Name != "" {
 			ctx = auth.ContextWithUser(ctx, user.Name)
 		}
 		s.logger.TraceContext(ctx, "client hello verify success")
+
+		handshakeConn, err = handshakeConfig.Dialer.DialContext(ctx, N.NetworkTCP, handshakeConfig.Server)
+		if err != nil {
+			return E.Cause(err, "server handshake")
+		}
+
+		_, err = handshakeConn.Write(clientHelloFrame.Bytes())
 		clientHelloFrame.Release()
+		if err != nil {
+			return E.Cause(err, "write client handshake")
+		}
 
 		var serverHelloFrame *buf.Buffer
 		serverHelloFrame, err = extractFrame(handshakeConn)
@@ -193,12 +250,12 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 
 		if serverRandom == nil {
 			s.logger.WarnContext(ctx, "server random extract failed, will copy bidirectional")
-			return bufio.CopyConn(ctx, conn, handshakeConn)
+			return bufio.CopyConn(ctx, s.flowControlledConn(conn), handshakeConn)
 		}
 
 		if s.strictMode && !isServerHelloSupportTLS13(serverHelloFrame.Bytes()) {
 			s.logger.WarnContext(ctx, "TLS 1.3 is not supported, will copy bidirectional")
-			return bufio.CopyConn(ctx, conn, handshakeConn)
+			return bufio.CopyConn(ctx, s.flowControlledConn(conn), handshakeConn)
 		}
 
 		serverHelloFrame.Release()
@@ -244,7 +301,13 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 			return E.Cause(err, "handshake relay")
 		}
 		s.logger.TraceContext(ctx, "handshake relay finished")
-		s.handler.NewConnectionEx(ctx, bufio.NewCachedConn(newVerifiedConn(conn, hmacAdd, hmacVerify, nil), clientFirstFrame), source, destination, onClose)
+		s.handler.NewConnectionEx(
+			ctx,
+			bufio.NewCachedConn(newVerifiedConn(conn, hmacAdd, hmacVerify, nil), clientFirstFrame),
+			source,
+			destination,
+			onClose,
+		)
 		return nil
 	}
 }
