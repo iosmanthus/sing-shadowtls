@@ -29,6 +29,7 @@ type Service struct {
 	handshakeForServerName map[string]HandshakeConfig
 	strictMode             bool
 	wildcardSNI            WildcardSNI
+	v3FlowControl          V3FlowControlConfig
 	handler                N.TCPConnectionHandlerEx
 	logger                 logger.ContextLogger
 }
@@ -49,8 +50,14 @@ type ServiceConfig struct {
 	HandshakeForServerName map[string]HandshakeConfig // for protocol version 2/3
 	StrictMode             bool                       // for protocol version 3
 	WildcardSNI            WildcardSNI                // for protocol version 3
+	V3FlowControl          V3FlowControlConfig        // for protocol version 3
 	Handler                N.TCPConnectionHandlerEx
 	Logger                 logger.ContextLogger
+}
+
+type V3FlowControlConfig struct {
+	UpstreamBytesPerSecond   int64
+	DownstreamBytesPerSecond int64
 }
 
 type User struct {
@@ -72,6 +79,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		handshakeForServerName: config.HandshakeForServerName,
 		strictMode:             config.StrictMode,
 		wildcardSNI:            config.WildcardSNI,
+		v3FlowControl:          config.V3FlowControl,
 		handler:                config.Handler,
 		logger:                 config.Logger,
 	}
@@ -81,6 +89,9 @@ func NewService(config ServiceConfig) (*Service, error) {
 	}
 
 	if service.handler == nil || service.logger == nil {
+		return nil, os.ErrInvalid
+	}
+	if service.v3FlowControl.UpstreamBytesPerSecond < 0 || service.v3FlowControl.DownstreamBytesPerSecond < 0 {
 		return nil, os.ErrInvalid
 	}
 	switch config.Version {
@@ -94,6 +105,10 @@ func NewService(config ServiceConfig) (*Service, error) {
 	}
 
 	return service, nil
+}
+
+func (s *Service) copyFallback(ctx context.Context, conn net.Conn, handshakeConn net.Conn) error {
+	return bufio.CopyConn(ctx, newFlowControlledConn(conn, s.v3FlowControl), handshakeConn)
 }
 
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -199,7 +214,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 			if err != nil {
 				return E.Cause(err, "server handshake")
 			}
-			return bufio.CopyConn(ctx, bufio.NewCachedConn(conn, clientHelloFrame), handshakeConn)
+			return s.copyFallback(ctx, bufio.NewCachedConn(conn, clientHelloFrame), handshakeConn)
 		}
 		if user.Name != "" {
 			ctx = auth.ContextWithUser(ctx, user.Name)
@@ -234,12 +249,12 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 
 		if serverRandom == nil {
 			s.logger.WarnContext(ctx, "server random extract failed, will copy bidirectional")
-			return bufio.CopyConn(ctx, conn, handshakeConn)
+			return s.copyFallback(ctx, conn, handshakeConn)
 		}
 
 		if s.strictMode && !supportTLS13 {
 			s.logger.WarnContext(ctx, "TLS 1.3 is not supported, will copy bidirectional")
-			return bufio.CopyConn(ctx, conn, handshakeConn)
+			return s.copyFallback(ctx, conn, handshakeConn)
 		}
 
 		if debug.Enabled {
